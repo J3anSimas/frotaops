@@ -26,7 +26,7 @@ Foundation ──► Fleet ──► Maintenance ──┐
 ```
 
 - **Maintenance** depends on Fleet (vehicle, odometer, status).
-- **Planning** depends on Fleet (availability) and indirectly on Maintenance (a vehicle with an open work order cannot be scheduled).
+- **Planning** depends on Fleet (availability, service eligibility) and indirectly on Maintenance (a vehicle with an open work order cannot be scheduled).
 - **Charter** depends on Planning (completed trips are the basis for measurement).
 - **Metrics** consumes data from every module.
 
@@ -47,63 +47,150 @@ Provide the technical and cross-cutting base on which the business modules are b
 ### Scope
 - Authentication and session
 - Access roles (RBAC): `admin`, `fleet_manager`, `maintenance`, `warehouse`, `planning`, `charter`, `read_only`
+- User × depot link: each user belongs to one or more depots (`admin` sees all); used to route notifications per depot
 - Base records: company/depots, cost centers, municipalities, holidays
 - Audit trail (who changed what, when, previous/new value)
 - System parameters (typed key/value, with history)
+- **Notifications**: e-mail sent through a project-owned interface (SMTP via Spring Mail; Mailpit in development), scheduled jobs, and a sent-notification log so the same alert is not repeated every day; users can unsubscribe
+- **File storage**: attachments stored through a project-owned interface (local disk in development, S3-compatible MinIO in the demo environment)
 - Fictional data generator (seed)
 
+### Decisions
+- **Single company, multiple depots from day one** (seed: 3 depots), all in **one state**. Every vehicle is registered in the municipality of the company headquarters, regardless of depot.
+- Per-depot data visibility (each user sees only their depots) is **later**; at first every user sees every depot and filters by depot. The user × depot link already prepares for it.
+
 ### Milestones
-- **M0.1** — Project structure, authentication, roles and permissions
+- **M0.1** — Project structure, authentication, roles and permissions, user × depot link
 - **M0.2** — Base records and system parameters
 - **M0.3** — Audit trail and initial seed
+- **M0.4** — Notifications (e-mail, scheduled jobs, sent log) and file storage
+- **M0.5** (later) — Per-depot data visibility
 
 ### Open questions
-- Stack (backend, frontend, database) and deployment strategy
-- Multi-company/multi-depot from day one, or a single depot?
+- Stack (frontend, database) and deployment strategy
 
 ---
 
 ## Module 1 — Fleet
 
 ### Goal
-Be the source of truth for every vehicle: identification, characteristics, mileage and operational status.
+Be the source of truth for every vehicle: identification, characteristics, mileage, operational status, documents and **service eligibility** (which services each vehicle may run).
+
+Supporting research, with sources: [docs/research/fleet-module.md](docs/research/fleet-module.md).
+
+### Operating context (assumptions)
+- The fictional company runs four **services**: `urban` (municipal), `intercity` (within the state, regulated by a fictional state agency), `charter` (contracts with municipalities) and `school` (school charter, with the extra requirements of the Brazilian Traffic Code, CTB arts. 136–139). Interstate charter (ANTT) is out of scope.
+- The fleet is **company-owned** (no leasing) and registered in the **"aluguel"** DETRAN category (paid passenger transport, CTB arts. 96 and 135); neither is stored as a field.
+- One state, multiple depots, every vehicle registered in the headquarters municipality (see Module 0).
 
 ### Entities
-- **Vehicle**: fleet number (unique), license plate (unique), chassis/VIN (unique), registration number (RENAVAM), chassis make/model, body, manufacturing/model year, type (urban, coach, minibus, school), capacity (seated/standing), accessibility (wheelchair lift, low floor, wheelchair space), fuel, depot
-- **Odometer reading**: vehicle, date/time, km, source (manual, fueling, work order, telematics), recorded by
+- **Vehicle**: internal id (identity), fleet number, license plate, chassis/VIN (unique, immutable), RENAVAM (unique, immutable), chassis make/model, body make/model, body number (NICV, optional), manufacturing/model year, **class** (`micro`, `mini`, `midi`, `basic`, `padron`, `articulated`, `coach`), capacity (seated/standing, as on the CRLV), accessibility (see below), air conditioning (optional), number of doors (optional), fuel, service entry date and km, current depot
+- **Accessibility** (ABNT NBR 14022): access type (`a` low floor, `b` high floor with boarding platform, `c` high floor with lift), number of wheelchair spaces, number of priority seats; **accessible** is derived, never typed
+- **Fleet number change** and **plate change**: vehicle, previous value, new value, date, reason
+- **Depot transfer**: vehicle, from depot, to depot, effective date, reason
+- **Odometer reading**: vehicle, date/time, km, source (manual, fueling, work order, telematics), recorded by, voided (with justification)
+- **Odometer replacement**: vehicle, date, final km of the old unit, initial km of the new one
 - **Status event**: vehicle, previous status, new status, date/time, reason, reference (e.g. work order)
-- **Documents** (later): licensing, insurance, inspection certificate, with expiry date
+- **Retirement**: reason (`sale`, `total_loss`, `end_of_life`, `dismantling`), date, final km, sale value (optional)
+- **Document type** (configurable): name, services that require it, validity rule, severity (`blocking` | `warning`), alert lead time
+- **Document**: vehicle, type, issue date, expiry date, attachments; each renewal is a new record
 
 ### Business rules
+
+#### Identification
+- **Identity is the internal id.** Every other module references the vehicle by id; screens show the current fleet number.
+- **Fleet number** can change: unique among non-retired vehicles, kept in a searchable history, released for reuse when the vehicle is retired. No format is enforced.
+- **License plate** can change (CONTRAN Res. 969/2022 forces the Mercosul format on some changes): accepts the old (`AAA9999`) and Mercosul (`AAA9A99`) formats, stored uppercase without hyphen; previous plates stay searchable; uniqueness is checked against current and previous plates of other vehicles.
+- **Chassis/VIN**: exactly 17 alphanumeric characters (CONTRAN Res. 968/2022); no check-digit validation, since the Brazilian rule does not require one.
+- **RENAVAM**: 11 digits; legacy 9-digit codes are left-padded with zeros. A wrong check digit is a **warning**, not an error, until the algorithm is confirmed against real RENAVAMs.
+- Plate and VIN outside the expected format block saving.
+- **Age** is counted from the **manufacturing year**, never the model year.
+
+#### Accessibility
+- `accessible = access_type ∈ {a, b, c} ∧ wheelchair_spaces ≥ 1`. Planning and GTFS export use only this derived flag.
+- Priority seats below `max(2, ceil(10% of seats))` raise a non-compliance warning; saving is allowed.
+
+#### Odometer
 - **Monotonic odometer**: a new reading cannot be lower than the previous one. Exception: an **odometer replacement** event, which records the final km of the old unit and the initial km of the new one, keeping a continuous *accumulated km*.
-- **Anomalous jump alert**: a reading implying a daily average above a configurable threshold raises an alert (likely typo).
+- **Readings are never edited.** A wrong reading is voided with a justification and stays in the history.
+- **Anomalous jump alert**: a reading implying a daily average above **N × the vehicle's average** (default 3×) **or** above an **absolute ceiling** (default 800 km/day) raises an alert; saving requires a justification.
+- **Valid dates**: no reading before the service entry date, after the retirement date, or in the future.
+- **Manual entry only** (single and spreadsheet) for now. The `fueling` and `telematics` sources are reserved; an ingestion interface is defined, with no adapter implemented.
+
+#### Average km/day
+- Rolling window over the **accumulated km** (so odometer replacements do not distort it): `(accumulated_km(today) − accumulated_km(today − window)) / window_days`. Days `in_maintenance` count in the denominator.
+- Parameters: **window** (default 90 days), **minimum history** in days (default 14) and in km (default 500).
+- Below the minimum history (e.g. a new vehicle), the average of vehicles of the same class is used and the result is flagged **estimated**.
+- Used by Module 2 only for **projection** (calendar and sorting), never to decide whether an item is due (see §2.1).
+
+#### Status and lifecycle
 - **Status state machine**:
   - `in_service` ⇄ `reserve`
   - `in_service` / `reserve` → `in_maintenance` → `in_service` / `reserve`
-  - any → `retired` (terminal; requires reason and date)
+  - any → `retired` (terminal)
 - Entering/leaving `in_maintenance` is driven by opening/closing a work order that immobilizes the vehicle (Module 2); manual changes require a justification.
+- **Status on a date**: the status history answers "what was the vehicle's status on date D", used by Planning for future dates and by Metrics for availability.
+- **Retirement** requires a reason from the closed list, date and final km. `sale` shows an informational reminder to notify the DETRAN (CTB art. 134); `dismantling` shows a reminder to request deregistration (CTB art. 126). The reminders are not a workflow.
 - A `retired` vehicle accepts no readings, work orders or schedule assignments.
+- **Depot transfer** is an event with an effective date; the depot on any date comes from the transfer history, so per-depot metrics stay correct. It never changes the registration municipality or the plate.
+
+#### Documents and eligibility
+- Initial document types (the municipal and state agencies are **fictional**):
+
+  | Document | Required for | Validity |
+  |---|---|---|
+  | CRLV (annual licensing) | all services | derived from the plate's last digit |
+  | Tachograph verification certificate (CTB art. 105, II; Inmetro) | all services | 2 years |
+  | Municipal agency inspection | `urban` | 1 year |
+  | State agency registration/inspection | `intercity` | 1 year |
+  | Civil liability insurance | `intercity`, `charter`, `school` | 1 year |
+  | School transport authorization (CTB art. 136) | `school` | date entered |
+  | Semiannual school inspection (CTB art. 136) | `school` | 6 months |
+
+- Every type starts as `blocking`; severity is configurable per type.
+- **Licensing due date** comes from a configurable table "plate last digit → deadline month" (one table, single state). Initial values from CONTRAN Res. 110/2000 (1–2 September, 3–5 October, 6–8 November, 9–0 December), flagged as not verified against the official text. The user records that the year's licensing was paid; the due date is never typed.
+- Renewals never overwrite: the **current document** of a type is the latest one still valid; history is immutable.
+- **Maximum age per service**: parameter in years of manufacture (seed: `urban` 10, `intercity` 15, `charter` 15, `school` 15), with an alert N months before (default 12). A charter contract may set a stricter limit (Module 4).
+- **Service eligibility** is derived, never typed: a vehicle is **eligible for a service** when every `blocking` document type required by that service is current **and** the vehicle is within that service's maximum age. Planning only accepts eligible vehicles (§3.2).
+
+#### Useful life
+- **Reference useful life per class** (seed, based on the FTA useful life benchmarks: `micro`/`mini` 10 years; `midi`, `basic`, `padron`, `articulated`, `coach` 14 years), used for fleet renewal planning. Unlike maximum age, it never affects eligibility.
+
+#### Alerts
+- Each document type has an alert lead time (default 30 days). A panel lists "due soon" and "expired" documents and vehicles approaching the maximum age, by depot.
+- A **daily e-mail digest per depot** (time configurable, default 07:00) goes to users with the `fleet_manager` role linked to that depot. The sent log prevents repeating the same alert; it is sent again only when an item changes from "due soon" to "expired". Uses the Module 0 notifications.
 
 ### Features
-- Vehicle CRUD with filters (status, type, depot, accessibility)
-- Vehicle profile: data, status timeline, km chart, linked work orders
-- Odometer entry, single and bulk (spreadsheet)
-- Fleet panel: count by status, average age, % accessible
+- Vehicle CRUD with filters (status, class, depot, accessibility, age, document situation, eligible service) and search by fleet number, current or previous plate, VIN and RENAVAM
+- Vehicle profile: data, status timeline, fleet number/plate/depot history, km chart, documents, eligibility per service, linked work orders
+- Odometer entry, single and bulk
+- Documents: registration, renewal, attachments (Module 0 file storage)
+- Expiry panel and daily e-mail digest
+- Fleet panel: count by status, average age, % accessible, % above useful life, documents due/expired, eligible vehicles per service
+- **Bulk import** (CSV and XLSX) of vehicles and odometer readings: every line is validated and errors are reported per line (line, field, value, rule); the import happens **only if there are no errors** (all or nothing); warnings such as an anomalous jump require explicit confirmation for the batch
+
+### Out of scope for Fleet
+- **Tires** → Module 2 (serialized parts)
+- **Traffic fines**, **fuel consumption**, **real-time tracking** and **periodic condition assessment** → not on the roadmap
+- **Vehicle allocation to routes** → Module 3
 
 ### Milestones
-- **M1.1** — Vehicle registry with uniqueness validations
-- **M1.2** — Odometer history with monotonicity and replacement rules
-- **M1.3** — Status state machine and timeline
-- **M1.4** — Vehicle profile and fleet panel
-- **M1.5** (later) — Documents with expiry alerts
+- **M1.1** — Vehicle registry: internal id, fleet number and plate with history, VIN/RENAVAM validation, class, capacity, structured accessibility, optional fields, service entry, depot
+- **M1.2** — Odometer: monotonicity, replacement, voiding, anomalous jump, date limits, average km/day
+- **M1.3** — Lifecycle: status state machine and timeline, status on a date, retirement with reason, depot transfer
+- **M1.4** — Documents and eligibility: configurable types, renewals, attachments, licensing by plate digit, maximum age per service, service eligibility (requires M0.4)
+- **M1.5** — Alerts: expiry panel and daily e-mail digest (requires M0.4)
+- **M1.6** — Vehicle profile and fleet panel
+- **M1.7** — Bulk import of vehicles and odometer readings
+- **M1.8** (later) — Hour meter and onboard equipment (validator, cameras, GPS: serial number, installation/removal)
 
 ### Acceptance criteria (examples)
 - A reading of 120,000 km cannot be saved if the last one was 121,500 km, except through an odometer replacement.
 - A retired vehicle never appears as an option in any new schedule or work order.
-
-### Open questions
-- Average km/day: computed over how many days (30, 90)? Also used by the preventive maintenance projection.
-- Will there be telematics/fueling integration, or manual entry only?
+- A vehicle whose plate changed from `ABC1234` to `ABC1C34` is found by searching either plate.
+- A vehicle with an expired school transport authorization is not eligible for `school` but stays eligible for `urban` if its urban documents are current.
+- A vehicle manufactured in 2015 is not eligible for `urban` (maximum age 10) in 2026, and the panel warned about it 12 months earlier.
+- A spreadsheet with 50 vehicles and one invalid VIN imports nothing and reports the line, field, value and rule.
 
 ---
 
@@ -115,7 +202,7 @@ Plan preventive maintenance, record corrective maintenance, control parts and me
 ### 2.1 Preventive maintenance plans
 
 #### Entities
-- **Maintenance plan**: name, applies to (chassis model / vehicle type), list of items
+- **Maintenance plan**: name, applies to (chassis model / vehicle class), list of items
 - **Plan item**: service (e.g. engine oil change), km interval, day interval, tolerance, expected parts and labor
 - **Vehicle × plan link**: with the last execution of each item (date + km)
 
@@ -128,19 +215,22 @@ next_date = last_execution_date + interval_days
 
 remaining_km   = next_km - current_km
 remaining_days = next_date - today
-km_equivalent_days = remaining_km / avg_km_per_day
 
-due_in = min(remaining_days, km_equivalent_days)
+km_state   = state(remaining_km,   km_alert_window)    # measured odometer only
+time_state = state(remaining_days, days_alert_window)  # calendar only
+item_state = worst(km_state, time_state)               # overdue > due_soon > ok
 ```
 
+- **Each criterion is evaluated on absolute values** with its own alert window (e.g. 10% of the interval, or a fixed km / N days). The item state is the worse of the two, and the panel shows which criterion triggered it.
+- The **average km/day** (Module 1) is used **only for projection**: `projected_km_date = today + remaining_km / avg_km_per_day`, `projected_due_date = min(next_date, projected_km_date)`. It sorts the due panel and feeds the calendar; it never changes an item's state, so a poor estimate only affects the forecast.
 - An item with only one interval uses that criterion alone.
-- **State**: `ok`, `due_soon` (within the alert window, e.g. 10% of the interval or N days), `overdue`.
+- **State**: `ok`, `due_soon` (within the alert window), `overdue`.
 - Executing an item (through a preventive work order) **resets both counters** from the execution date and km, not from the theoretical due point.
 - First link for a new vehicle: baseline = service entry date and initial km.
 
 #### Features
 - Plan and item management
-- Due panel: list sorted by `due_in`, showing which criterion triggered it (km or time)
+- Due panel: list by state, sorted by `projected_due_date`, showing which criterion triggered it (km or time) and whether the projection is estimated
 - Preventive work order generation from overdue/due-soon items (grouping items of the same vehicle)
 - Projection: preventive maintenance calendar for the coming weeks
 
@@ -217,7 +307,7 @@ Define the service offering (routes, itineraries, timetables) and assign vehicle
 ### 3.1 Routes, itineraries and timetables
 
 #### Entities
-- **Route**: code, name, type (urban, intercity, charter), municipality(ies) served, vehicle requirements (minimum type, mandatory accessibility)
+- **Route**: code, name, **service** (`urban`, `intercity`, `charter`, `school`; exactly one per route), municipality(ies) served, vehicle requirements (minimum class, mandatory accessibility)
 - **Itinerary**: route, direction (outbound/inbound/loop), sequence of stops/streets, length in km, running time per time band
 - **Stop**: name, coordinates (optional), terminal yes/no
 - **Timetable**: route, day type (weekday, Saturday, Sunday/holiday), validity period, list of **trips** (departure time, direction, itinerary)
@@ -244,7 +334,8 @@ Each assignment is checked against:
 **Vehicle**
 - Status must be `in_service` or `reserve` on the date — a vehicle `in_maintenance` or `retired` is **blocked**.
 - Cannot be in two blocks with overlapping times.
-- Must meet the route requirements (type, capacity, accessibility).
+- Must meet the route requirements (minimum class, capacity, accessibility).
+- Must be **eligible for the route's service** on the date (Module 1: current blocking documents and within the maximum age). When the route belongs to a charter contract with its own maximum age, the stricter of the service and contract limits applies.
 - Overdue preventive maintenance: block or warn, depending on a parameter.
 
 **Driver**
@@ -300,7 +391,7 @@ Manage charter contracts with municipalities, measure monthly what was delivered
 #### Entities
 - **Contract**: number, contracting municipality, scope (e.g. school transport), validity (start/end), estimated total value, price adjustment index and base date, status (`active`, `suspended`, `terminated`)
 - **Amendment**: term, value, addition/removal of routes, with effective date
-- **Contracted route**: contract, code, description, itinerary (Module 3), km per trip, planned trips per day/day type, required vehicle type, requirements (accessibility, attendant, driver school transport training)
+- **Contracted route**: contract, code, description, itinerary (Module 3), km per trip, planned trips per day/day type, minimum vehicle class, maximum vehicle age (optional, stricter than the service limit), requirements (accessibility, attendant, driver school transport training)
 - **Pricing model** (per route):
   - **per km**: rate/km × km completed
   - **per trip**: rate/trip × trips completed
@@ -387,15 +478,15 @@ Consolidate the operational view for managers in a single place.
 
 Order that delivers demonstrable value early and respects dependencies:
 
-1. **M0.1 → M0.3** — Foundation
-2. **M1.1 → M1.4** — Fleet
+1. **M0.1 → M0.4** — Foundation (M0.4 notifications and file storage must precede M1.4)
+2. **M1.1 → M1.7** — Fleet (M1.1 → M1.4 must precede M3.4: scheduling needs service eligibility)
 3. **M2.1 → M2.3** — Corrective work orders and inventory
 4. **M2.4 → M2.5** — Preventive maintenance ("whichever comes first" rule)
 5. **M3.1 → M3.5** — Planning and scheduling with validations
 6. **M3.6** — Actuals
 7. **M4.1 → M4.6** — Full charter module
 8. **M2.6 + M5.x** — Metrics and dashboards
-9. Later items (M1.5, M3.7, M4.7, M5.4)
+9. Later items (M0.5, M1.8, M3.7, M4.7, M5.4)
 
 ---
 
