@@ -6,6 +6,8 @@ Rules come from [ROADMAP.md](../../ROADMAP.md) Module 1; section names are cited
 
 M1.8 (hour meter and onboard equipment) is marked *later* and gets no issues yet.
 
+**Status**: created on GitHub on 2026-10-30 as issues #21–#52, in key order (`M1.1-01` = #21 … `M1.7-02` = #52; the parent `M1.4-00` = #39). GitHub is now the source of truth; this draft is kept as a record.
+
 ---
 
 ## M1.1 — Vehicle registry
