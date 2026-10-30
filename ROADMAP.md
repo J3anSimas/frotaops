@@ -67,7 +67,7 @@ Provide the technical and cross-cutting base on which the business modules are b
 - **M0.5** (later) — Per-depot data visibility
 
 ### Open questions
-- Stack (frontend, database) and deployment strategy
+- Frontend stack and deployment strategy (database decided in [ADR 0001](docs/adr/0001-database.md))
 
 ---
 
@@ -492,7 +492,7 @@ Order that delivers demonstrable value early and respects dependencies:
 
 ## Pending technical decisions
 
-- Frontend and database stack (backend: Java 21 + Spring Boot 4, in `server/`)
+- Frontend stack (backend: Java 21 + Spring Boot 4, in `server/`; database: PostgreSQL 18+ with Flyway, see [ADR 0001](docs/adr/0001-database.md))
 - Testing strategy for domain rules
 - Report generation (PDF/spreadsheet)
 - Hosting and CI/CD
